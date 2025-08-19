@@ -5,6 +5,20 @@ project contains a socket server that keeps track of the game state and a
 simple Pygame client.  Two or more players can connect to the server and race
 around the arena in real time.
 
+## Getting the code
+
+The game is written in pure Python and runs directly from source—no binaries
+are required.  Download the code and install the only dependency, `pygame`:
+
+```bash
+git clone https://github.com/<user>/LightBike
+cd LightBike
+pip install -r requirements.txt
+```
+
+Alternatively, grab the latest source archive from the GitHub releases page
+and extract it.
+
 ## Running the game
 
 1. Start the server on a machine reachable by all players:
