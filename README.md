@@ -11,7 +11,7 @@ The game is written in pure Python and runs directly from source—no binaries
 are required.  Download the code and install the only dependency, `pygame`:
 
 ```bash
-git clone https://github.com/<user>/LightBike
+git clone https://github.com/Dirty-Dan/LightBike
 cd LightBike
 pip install -r requirements.txt
 ```
