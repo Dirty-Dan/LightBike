@@ -1,156 +1,272 @@
-"""Minimal socket server for the Light Bike game.
+"""Authoritative online multiplayer server for Neon Circuit.
 
-This server keeps track of every connected player and broadcasts the game
-state to all clients on every update.  Each client only sends movement
-commands; the authoritative position is maintained here.  The protocol is a
-simple JSON message:
-
-    {"action": "move", "direction": "left"}
-
-The game state that is sent back looks like:
-
-    {"players": {"player1": {"x": 10, "y": 20, "color": [255,0,0],
-                             "trail": [{"x":10,"y":20}, ...]}, ...}}
-
-Running this module launches the server on port 25565.
+Protocol (newline-delimited JSON):
+- Client -> server:
+    {"action": "join", "name": "Alice"}
+    {"action": "turn", "dir": -1|1}
+    {"action": "start"}
+- Server -> client:
+    {
+      "type": "welcome",
+      "player_index": 0,
+      "name": "Alice"
+    }
+    {
+      "type": "state",
+      "mode": "lobby"|"playing"|"round_over",
+      "players": [...],
+      "scores": {"0": 1, ...},
+      "message": "..."
+    }
 """
 
 from __future__ import annotations
 
+import argparse
 import json
-import select
 import socket
-from typing import Dict, List, Tuple
+import threading
+import time
+from dataclasses import dataclass
+from typing import Dict, Optional
 
-HOST = "0.0.0.0"
-PORT = 25565
-STEP = 5  # distance moved per command
+from neon_circuit.config import COLOR_PRESETS, SOUND_PRESETS
+from neon_circuit.gameplay import ArenaRound, PlayerConfig
+
+DEFAULT_HOST = "0.0.0.0"
+DEFAULT_PORT = 25565
+MAX_PLAYERS = 4
 
 
-class LightBikeServer:
-    """TCP server handling multiple Light Bike clients."""
+@dataclass
+class ClientInfo:
+    sock: socket.socket
+    addr: tuple[str, int]
+    name: str
+    player_index: int
 
-    def __init__(self) -> None:
+
+class NeonCircuitServer:
+    def __init__(self, host: str, port: int, tick_rate: int = 30) -> None:
+        self.host = host
+        self.port = port
+        self.tick_rate = tick_rate
+
         self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Allow fast restart during development
         self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.server_socket.bind((HOST, PORT))
+        self.server_socket.bind((self.host, self.port))
         self.server_socket.listen()
 
-        # Mapping of socket -> player id
-        self._socket_to_pid: Dict[socket.socket, str] = {}
+        self.clients: Dict[socket.socket, ClientInfo] = {}
+        self.scores: Dict[int, int] = {i: 0 for i in range(MAX_PLAYERS)}
+        self.lock = threading.Lock()
 
-        # Game state sent to every client
-        self.players: Dict[str, Dict[str, object]] = {}
-        self.next_id = 1
+        self.round: Optional[ArenaRound] = None
+        self.mode = "lobby"
+        self.round_over_time: float = 0.0
 
-        self.sockets: List[socket.socket] = [self.server_socket]
+    def _make_player_config(self, idx: int) -> PlayerConfig:
+        return PlayerConfig(
+            index=idx,
+            color=COLOR_PRESETS[idx % len(COLOR_PRESETS)],
+            sound_profile=SOUND_PRESETS[idx % len(SOUND_PRESETS)],
+            controls={},
+        )
 
-        # Predefined colours for up to four players
-        self.colours: List[Tuple[int, int, int]] = [
-            (255, 0, 0),    # red
-            (0, 0, 255),    # blue
-            (0, 255, 0),    # green
-            (255, 255, 0),  # yellow
-        ]
+    def _active_player_configs(self) -> list[PlayerConfig]:
+        indices = sorted(info.player_index for info in self.clients.values())
+        return [self._make_player_config(idx) for idx in indices]
 
-    # ------------------------------------------------------------------ utils
-    def _broadcast(self) -> None:
-        """Send the entire game state to every connected client."""
-        data = (json.dumps({"players": self.players}) + "\n").encode("utf-8")
-        for sock in list(self.sockets):
-            if sock is self.server_socket:
-                continue
-            try:
-                sock.sendall(data)
-            except OSError:
-                # If sending fails, drop the client
-                self._remove_client(sock)
+    def _start_round(self) -> None:
+        configs = self._active_player_configs()
+        if len(configs) < 2:
+            return
+        self.round = ArenaRound(configs)
+        self.mode = "playing"
 
-    def _remove_client(self, sock: socket.socket) -> None:
-        pid = self._socket_to_pid.pop(sock, None)
-        if pid and pid in self.players:
-            del self.players[pid]
-        if sock in self.sockets:
-            self.sockets.remove(sock)
+    def _serialize_state(self, message: str = "") -> dict[str, object]:
+        players = []
+        by_index = {c.player_index: c for c in self.clients.values()}
+
+        for idx, info in sorted(by_index.items()):
+            bike_payload = None
+            if self.round:
+                for bike in self.round.bikes:
+                    if bike.config.index == idx:
+                        bike_payload = {
+                            "pos": [bike.pos[0], bike.pos[1]],
+                            "trail": [[t[0], t[1]] for t in bike.trail],
+                            "alive": bike.alive,
+                            "color": list(bike.config.color),
+                        }
+                        break
+
+            players.append(
+                {
+                    "index": idx,
+                    "name": info.name,
+                    "bike": bike_payload,
+                }
+            )
+
+        return {
+            "type": "state",
+            "mode": self.mode,
+            "players": players,
+            "scores": {str(k): v for k, v in self.scores.items()},
+            "message": message,
+        }
+
+    def _send_json(self, sock: socket.socket, payload: dict[str, object]) -> bool:
+        try:
+            sock.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+            return True
+        except OSError:
+            return False
+
+    def _broadcast_state(self, message: str = "") -> None:
+        payload = self._serialize_state(message)
+        dead = []
+        for sock in self.clients:
+            if not self._send_json(sock, payload):
+                dead.append(sock)
+        for sock in dead:
+            self._drop_client(sock)
+
+    def _drop_client(self, sock: socket.socket) -> None:
+        info = self.clients.pop(sock, None)
         try:
             sock.close()
-        finally:
-            self._broadcast()
+        except OSError:
+            pass
+        if info:
+            print(f"[-] Player disconnected: {info.name} ({info.addr[0]}:{info.addr[1]})")
+            if self.mode == "playing" and self.round:
+                for bike in self.round.bikes:
+                    if bike.config.index == info.player_index:
+                        bike.alive = False
+                        self.round._finalize_result()  # keep server deterministic
+                        break
 
-    # ----------------------------------------------------------------- accept
-    def _accept_new_client(self) -> None:
-        client_socket, _ = self.server_socket.accept()
-        self.sockets.append(client_socket)
-
-        pid = f"player{self.next_id}"
-        self._socket_to_pid[client_socket] = pid
-
-        # Place players at slightly different starting positions
-        start_x = 50 + 100 * ((self.next_id - 1) % 4)
-        start_y = 50 + 100 * ((self.next_id - 1) // 4)
-        colour = self.colours[(self.next_id - 1) % len(self.colours)]
-
-        self.players[pid] = {
-            "x": start_x,
-            "y": start_y,
-            "color": list(colour),
-            "trail": [],
-        }
-        self.next_id += 1
-        self._broadcast()
-
-    # ------------------------------------------------------------- client data
-    def _handle_client(self, sock: socket.socket) -> None:
+    def _handle_line(self, sock: socket.socket, line: bytes) -> None:
         try:
-            data = sock.recv(1024)
-            if not data:
-                # Client disconnected
-                self._remove_client(sock)
-                return
-            message = json.loads(data.decode("utf-8"))
-        except Exception:
-            self._remove_client(sock)
+            msg = json.loads(line.decode("utf-8"))
+        except json.JSONDecodeError:
             return
 
-        pid = self._socket_to_pid.get(sock)
-        if not pid:
-            return
-        player = self.players.get(pid)
-        if not player:
+        action = msg.get("action")
+        info = self.clients.get(sock)
+        if not info:
             return
 
-        if message.get("action") == "move":
-            direction = message.get("direction")
-            if direction == "left":
-                player["x"] -= STEP
-            elif direction == "right":
-                player["x"] += STEP
-            elif direction == "up":
-                player["y"] -= STEP
-            elif direction == "down":
-                player["y"] += STEP
+        if action == "turn" and self.mode == "playing" and self.round:
+            dir_value = int(msg.get("dir", 0))
+            if dir_value in (-1, 1):
+                self.round.queue_turn(info.player_index, dir_value)
 
-            player["trail"].append({"x": player["x"], "y": player["y"]})
+        elif action == "start" and self.mode == "lobby":
+            if len(self.clients) >= 2:
+                self._start_round()
+                self._broadcast_state("Round started")
 
-        self._broadcast()
+    def _client_thread(self, sock: socket.socket) -> None:
+        buff = b""
+        try:
+            while True:
+                chunk = sock.recv(4096)
+                if not chunk:
+                    break
+                buff += chunk
+                while b"\n" in buff:
+                    line, buff = buff.split(b"\n", 1)
+                    if line.strip():
+                        with self.lock:
+                            self._handle_line(sock, line)
+        except OSError:
+            pass
+        finally:
+            with self.lock:
+                self._drop_client(sock)
+                self._broadcast_state()
 
-    # ------------------------------------------------------------------- main
-    def serve_forever(self) -> None:
-        print(f"Server started on {HOST}:{PORT}")
+    def _accept_clients_forever(self) -> None:
         while True:
-            readable, _, _ = select.select(self.sockets, [], [])
-            for sock in readable:
-                if sock is self.server_socket:
-                    self._accept_new_client()
+            sock, addr = self.server_socket.accept()
+            with self.lock:
+                if len(self.clients) >= MAX_PLAYERS:
+                    self._send_json(sock, {"type": "error", "message": "Lobby is full (max 4 players)."})
+                    sock.close()
+                    continue
+
+                player_index = 0
+                used = {client.player_index for client in self.clients.values()}
+                while player_index in used:
+                    player_index += 1
+
+                self._send_json(sock, {"type": "welcome", "player_index": player_index})
+
+                sock.settimeout(None)
+                info = ClientInfo(
+                    sock=sock,
+                    addr=addr,
+                    name=f"Player {player_index + 1}",
+                    player_index=player_index,
+                )
+                self.clients[sock] = info
+                print(f"[+] Player connected: {info.name} ({addr[0]}:{addr[1]})")
+                self._broadcast_state("Player joined")
+
+            thread = threading.Thread(target=self._client_thread, args=(sock,), daemon=True)
+            thread.start()
+
+    def _game_loop(self) -> None:
+        last = time.perf_counter()
+        while True:
+            now = time.perf_counter()
+            dt = now - last
+            last = now
+
+            with self.lock:
+                if self.mode == "playing" and self.round:
+                    result = self.round.update(dt)
+                    if result:
+                        self.mode = "round_over"
+                        if result.winner is not None:
+                            self.scores[result.winner] += 1
+                        self.round_over_time = time.perf_counter()
+                        self._broadcast_state(result.message)
+                    else:
+                        self._broadcast_state()
+                elif self.mode == "round_over":
+                    self._broadcast_state("Round over - restarting in 3 seconds")
+                    if time.perf_counter() - self.round_over_time >= 3.0:
+                        if len(self.clients) >= 2:
+                            self._start_round()
+                            self._broadcast_state("New round")
+                        else:
+                            self.mode = "lobby"
+                            self.round = None
                 else:
-                    self._handle_client(sock)
+                    self._broadcast_state("Waiting for 2+ players. Host presses S to start.")
+
+            time.sleep(1.0 / self.tick_rate)
+
+    def serve_forever(self) -> None:
+        print(f"Neon Circuit server listening on {self.host}:{self.port}")
+        accept_thread = threading.Thread(target=self._accept_clients_forever, daemon=True)
+        accept_thread.start()
+        self._game_loop()
 
 
 def main() -> None:
-    LightBikeServer().serve_forever()
+    parser = argparse.ArgumentParser(description="Neon Circuit online multiplayer server")
+    parser.add_argument("--host", default=DEFAULT_HOST)
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT)
+    args = parser.parse_args()
+
+    server = NeonCircuitServer(args.host, args.port)
+    server.serve_forever()
 
 
 if __name__ == "__main__":
     main()
-

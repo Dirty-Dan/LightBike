@@ -1,11 +1,12 @@
 # Neon Circuit
 
-**Neon Circuit** is a polished, local-multiplayer light-bike arena game inspired by classic Tron gameplay.
+**Neon Circuit** is a polished light-bike arena game inspired by classic Tron gameplay, with both local and online multiplayer modes.
 It is built with **Python + Pygame** for fast development and easy cross-platform packaging for **Windows** and **Linux**.
 
 ## Features
 
 - 2 to 4 local players on one machine
+- Online multiplayer over LAN/Internet (authoritative server + thin clients)
 - Continuous forward bike movement with 90° left/right turns
 - Solid light trails with instant elimination on collision
 - Round-based gameplay with persistent scoreboard
@@ -61,6 +62,25 @@ You can also launch with:
 python -m neon_circuit
 ```
 
+
+## Online Multiplayer
+
+Run one server and connect 2-4 clients:
+
+```bash
+# Terminal 1 (host/server)
+python server.py --host 0.0.0.0 --port 25565
+
+# Terminal 2+ (each player)
+python client.py --host <SERVER_IP> --port 25565
+```
+
+Online controls:
+
+- `A`/`D` or `Left`/`Right` = queue turn
+- `S` = start round (any connected player can start when 2+ players are present)
+- `ESC` = quit client
+
 ## Build Executables (Windows and Linux)
 
 > Build on each target OS to produce native executables.
@@ -108,8 +128,8 @@ LightBike/
 │   ├── config.py             # Tunables, controls, palettes
 │   ├── gameplay.py           # Bike movement, trails, collisions
 │   └── rendering.py          # Neon UI + arena drawing helpers
-├── server.py                 # Legacy network prototype (unused)
-└── client.py                 # Legacy network prototype (unused)
+├── server.py                 # Authoritative online multiplayer server
+└── client.py                 # Online multiplayer client
 ```
 
 ## Extensibility Notes
